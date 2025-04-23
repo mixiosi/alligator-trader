@@ -431,8 +431,15 @@ async def main():
         await ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=15)
         logger.info("Successfully connected to IB.")
 
-        # Wait for connection readiness
-        await ib.reqAccountUpdatesAsync(account='All', subscribe=False) # Ensure connection is fully established
+        # Wait for connection readiness by making an initial request
+        # REMOVED 'subscribe=False' from the next line
+        acct_vals = await ib.reqAccountValuesAsync() # Using reqAccountValuesAsync is often better just to get a snapshot
+        if not acct_vals:
+            logger.warning("Initial account value request returned empty, but connection seems established.")
+        # Alternatively, keep reqAccountUpdatesAsync without subscribe=False if you prefer:
+        # await ib.reqAccountUpdatesAsync(account='All')
+
+        logger.info("Connection appears established.")
 
         # Define the contract
         contract = create_contract(SYMBOL, EXCHANGE, CURRENCY)
@@ -443,7 +450,6 @@ async def main():
             return
         contract = qual_contracts[0] # Use the qualified contract
         logger.info(f"Qualified contract: {contract}")
-
 
         # Initial run
         await run_strategy()
