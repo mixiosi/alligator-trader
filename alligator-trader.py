@@ -19,7 +19,8 @@ SYMBOL = 'MSTR'
 EXCHANGE = 'SMART'
 CURRENCY = 'USD'
 PRIMARY_TIMEFRAME = '4 hours' # Timeframe for primary signals (CMO, StochRSI, current Alligator, ATR)
-LONGTERM_TIMEFRAME = '6 hours' # Timeframe for long-term confirmation (ADX, LT Alligator, LT EMA)
+# CHANGED '6 hours' to '8 hours' (valid IB API bar size)
+LONGTERM_TIMEFRAME = '8 hours' # Timeframe for long-term confirmation (ADX, LT Alligator, LT EMA)
 ORDER_SIZE_PERCENT = 0.01 # Risk 1% of portfolio value per trade (adjust as needed)
 SL_ATR_MULTIPLIER = 1.5   # Stop loss distance in ATR multiples
 TP_ATR_MULTIPLIER = 3.0   # Take profit distance in ATR multiples
@@ -222,30 +223,41 @@ def get_account_value(ib_conn: IB, currency: str = 'USD', account_id: str = None
          logger.error(f"Error retrieving/processing cached account value: {e}", exc_info=True)
          return None
 
-async def check_existing_position(ib_conn: IB, contract: Contract):
+def check_existing_position(ib_conn: IB, contract: Contract): # REMOVED async
     """Checks if there is an existing position for the contract using cached data."""
-    # Use ib_conn.positions() for cached data if reqPositions() was called
-    # Or use await ib_conn.reqPositionsAsync() for a live update (slower)
     try:
         # Let's use the cached version assuming reqPositions() runs periodically or at start
-        # Note: Might need to call ib.reqPositions() in main loop or periodically if cache isn't updated
         positions = ib_conn.positions() # Access cached positions
         conId_to_check = contract.conId
         if not conId_to_check:
             logger.warning(f"Contract for {contract.symbol} not qualified yet, cannot check position by conId.")
-            # Fallback to symbol check? Risky if multiple contracts for same symbol
-            return 0
+            return 0 # Cannot check accurately
 
+        account_positions = {} # Store positions per account
         for pos in positions:
-            if pos.contract.conId == conId_to_check:
-                logger.info(f"Existing position found for {contract.symbol} (conId {conId_to_check}): {pos.position} shares @ {pos.avgCost}.")
-                return pos.position # Returns size (positive for long, negative for short)
+             # Optional: logger.debug(f"Cached pos: {pos.account} {pos.contract.symbol} Qty: {pos.position}")
+             if pos.contract.conId == conId_to_check:
+                 account_positions[pos.account] = {'position': pos.position, 'avgCost': pos.avgCost}
 
-        logger.info(f"No existing position found for {contract.symbol} (conId {conId_to_check}) in cache.")
-        return 0 # No position
+        if not account_positions:
+            # This is normal if no position exists
+            # logger.info(f"No existing position found for {contract.symbol} (conId {conId_to_check}) in cache.")
+            return 0 # No position found
+
+        # Sum positions across all accounts for this conId
+        total_position = sum(p['position'] for p in account_positions.values())
+
+        if total_position != 0:
+             first_account = list(account_positions.keys())[0]
+             avg_cost = account_positions[first_account]['avgCost']
+             logger.info(f"Existing position found for {contract.symbol} (conId {conId_to_check}). Total across accounts: {total_position}. Example cost: {avg_cost} in account {first_account}.")
+             return total_position # Return total size
+        else:
+             # logger.info(f"Position found for {contract.symbol} (conId {conId_to_check}) but total size is zero.")
+             return 0 # Position exists but is flat
 
     except Exception as e:
-        logger.error(f"Error checking existing position for {contract.symbol}: {e}", exc_info=True)
+        logger.error(f"Error checking existing position cache for {contract.symbol}: {e}", exc_info=True)
         return 0 # Assume no position on error
 
 # --- Modified Order Placement ---
@@ -418,17 +430,69 @@ async def run_strategy():
         return
 
     # --- 4. Get Historical Data ---
-    # Duration string calculation (simplified)
-    duration_str = f"{MAX_DATA_REQUEST_BARS * 2} D" # Fetch ample data
+    # Calculate a reasonable duration string to avoid exceeding 365 days
+    bars_needed = MAX_DATA_REQUEST_BARS # 300
+    # Find hours per bar for the longer timeframe (which requires more days)
+    try:
+        # Handle different units (hours, mins etc.) more robustly if needed
+        # This simple parsing assumes format like "X hours" or "Y mins"
+        primary_tf_parts = PRIMARY_TIMEFRAME.split()
+        longterm_tf_parts = LONGTERM_TIMEFRAME.split()
 
+        # Convert timeframes to hours for comparison
+        def timeframe_to_hours(parts):
+            value = int(parts[0])
+            unit = parts[1].lower()
+            if 'hour' in unit:
+                return value
+            elif 'min' in unit:
+                return value / 60
+            elif 'day' in unit:
+                 return value * 24
+            # Add other units if necessary
+            else:
+                logger.warning(f"Unrecognized timeframe unit: {unit}. Defaulting to 1 hour.")
+                return 1
+
+        primary_tf_hours = timeframe_to_hours(primary_tf_parts)
+        longterm_tf_hours = timeframe_to_hours(longterm_tf_parts)
+
+        # Use the timeframe that yields fewer bars per day (longer duration bar = larger hours value)
+        hours_per_bar = max(primary_tf_hours, longterm_tf_hours)
+
+    except (ValueError, IndexError):
+        logger.error(f"Could not parse hours from timeframes: '{PRIMARY_TIMEFRAME}', '{LONGTERM_TIMEFRAME}'. Defaulting calculation.")
+        hours_per_bar = 6 # Default to 6 hours if parsing fails
+
+    # Calculate approximate days needed
+    if hours_per_bar <= 0: hours_per_bar = 1 # Prevent division by zero, assume 1 hour if invalid
+    bars_per_day_approx = 24 / hours_per_bar
+    # Ensure bars_per_day_approx is at least 1 to avoid excessive days calculation
+    if bars_per_day_approx < 1: bars_per_day_approx = 1
+    days_needed = int(bars_needed / bars_per_day_approx) + 2 # Add 2 day buffer instead of 1
+
+    # Add a safety margin (e.g., 50% or fixed days) to handle weekends/holidays/gaps
+    # Increased safety margin slightly
+    safety_margin_days = 45 # Add ~1.5 months extra
+    duration_days = days_needed + safety_margin_days
+
+    # Ensure duration doesn't exceed IB's limit for daily requests (use ~360 as safe limit)
+    max_allowable_days = 360
+    duration_days = min(duration_days, max_allowable_days)
+
+    duration_str = f"{duration_days} D"
+    logger.info(f"Calculated historical data duration: {duration_str} (requesting ~{bars_needed}+ bars for longest TF: {hours_per_bar}h)")
+
+    # Fetch data using the calculated duration
     df_primary = await get_historical_data(ib, contract, PRIMARY_TIMEFRAME, duration_str)
     if df_primary.empty:
-        logger.warning(f"Could not get primary timeframe ({PRIMARY_TIMEFRAME}) data. Skipping.")
+        logger.warning(f"Could not get primary timeframe ({PRIMARY_TIMEFRAME}) data using duration {duration_str}. Skipping.")
         return
 
+    # Use the same duration for the long-term data request
     df_longterm = await get_historical_data(ib, contract, LONGTERM_TIMEFRAME, duration_str)
     if df_longterm.empty:
-        logger.warning(f"Could not get long-term timeframe ({LONGTERM_TIMEFRAME}) data. Skipping.")
+        logger.warning(f"Could not get long-term timeframe ({LONGTERM_TIMEFRAME}) data using duration {duration_str}. Skipping.")
         return
 
     # --- 5. Calculate Indicators ---
@@ -450,10 +514,15 @@ async def run_strategy():
         current_price = latest_primary['close'] # Use primary close price for checks & orders
 
         # Check alignment (optional but good practice)
+        # Get the max timeframe duration in hours for the check
+        max_tf_hours = max(timeframe_to_hours(PRIMARY_TIMEFRAME.split()), timeframe_to_hours(LONGTERM_TIMEFRAME.split()))
+        allowed_lag = pd.Timedelta(hours=max_tf_hours * 1.5) # Allow 1.5x the longest bar duration lag
         time_diff = abs(latest_primary.name - latest_longterm.name)
-        if time_diff > pd.Timedelta(hours=max(int(PRIMARY_TIMEFRAME.split()[0]), int(LONGTERM_TIMEFRAME.split()[0])) * 1.5): # Allow some lag
-             logger.warning(f"Significant time difference between latest primary ({latest_primary.name}) and longterm ({latest_longterm.name}) bars: {time_diff}. Check data fetching.")
+
+        if time_diff > allowed_lag:
+             logger.warning(f"Significant time difference between latest primary ({latest_primary.name}) and longterm ({latest_longterm.name}) bars: {time_diff} (Allowed: {allowed_lag}). Check data fetching/alignment.")
              # Decide whether to proceed or skip if alignment is critical
+             # return # Uncomment to skip if alignment fails
 
     except IndexError:
         logger.warning("Not enough data rows after indicator calculation to get latest data. Skipping check.")
@@ -473,14 +542,17 @@ async def run_strategy():
     required_primary_cols = ['close', 'atr', 'cmo', 'stochrsi_k', 'stochrsi_d', 'alligator_jaw_primary', 'alligator_teeth_primary', 'alligator_lips_primary']
     required_longterm_cols = ['close', 'adx', f'ema_{EMA_LONGTERM_PERIOD}', 'alligator_jaw_longterm', 'alligator_teeth_longterm', 'alligator_lips_longterm']
 
-    if not all(col in latest_primary.index for col in required_primary_cols):
+    primary_cols_exist = all(col in latest_primary.index for col in required_primary_cols)
+    longterm_cols_exist = all(col in latest_longterm.index for col in required_longterm_cols)
+
+    if not primary_cols_exist:
          missing_cols = [col for col in required_primary_cols if col not in latest_primary.index]
-         logger.error(f"Missing required columns in latest primary data: {missing_cols}")
-         return
-    if not all(col in latest_longterm.index for col in required_longterm_cols):
+         logger.error(f"Missing required columns in latest primary data ({latest_primary.name}): {missing_cols}")
+         return # Stop if essential primary indicators are missing
+    if not longterm_cols_exist:
          missing_cols = [col for col in required_longterm_cols if col not in latest_longterm.index]
-         logger.error(f"Missing required columns in latest long-term data: {missing_cols}")
-         return
+         logger.error(f"Missing required columns in latest long-term data ({latest_longterm.name}): {missing_cols}")
+         return # Stop if essential long-term indicators are missing
 
 
     primary_trend = determine_alligator_trend(latest_primary['alligator_jaw_primary'], latest_primary['alligator_teeth_primary'], latest_primary['alligator_lips_primary'])
@@ -534,12 +606,18 @@ async def run_strategy():
             take_profit_val = current_price - (atr_value * TP_ATR_MULTIPLIER)
             risk_per_share = stop_loss_val - current_price
 
+        # Ensure risk per share is positive before division
         if risk_per_share <= 0:
-            logger.error(f"Risk per share is zero or negative ({risk_per_share:.2f}). Cannot calculate position size. Check ATR and multipliers.")
+            logger.error(f"Risk per share is zero or negative ({risk_per_share:.2f}). Cannot calculate position size. Check ATR ({atr_value:.3f}) and multipliers.")
             return
 
         # Calculate Position Size (using logic similar to bb_ml_stable3)
         max_risk_amount = account_value * ORDER_SIZE_PERCENT
+        # Ensure max_risk_amount is positive
+        if max_risk_amount <= 0:
+             logger.error(f"Max risk amount is zero or negative ({max_risk_amount:.2f}). Check account value and risk percent.")
+             return
+
         quantity = int(max_risk_amount / risk_per_share)
         quantity = max(1, min(quantity, 10000)) # Ensure min 1 share, add reasonable max cap
 
@@ -583,30 +661,12 @@ async def main():
     try:
         logger.info(f"Connecting to IB TWS/Gateway at {IB_HOST}:{IB_PORT} with ClientID {IB_CLIENT_ID}...")
         await ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=20) # Increased timeout
-        logger.info(f"Successfully connected to IB. Server version: {ib.serverVersion()}. TWS Time: {ib.reqCurrentTime()}")
 
-        # Start account updates stream
-        logger.info("Starting account updates subscription...")
-        try:
-            await ib.reqAccountUpdatesAsync(account='All') # Requires 'account' arg
-            logger.info(f"Account updates subscription initiated. Waiting {ACCOUNT_SYNC_WAIT_SECONDS}s for initial data...")
-            await asyncio.sleep(ACCOUNT_SYNC_WAIT_SECONDS)
-            # Additionally request positions to populate cache initially
-            await ib.reqPositionsAsync()
-            logger.info("Initial account data sync period complete.")
-        except Exception as e:
-            logger.error(f"Error initiating account updates/positions: {e}. Aborting.", exc_info=True)
-            return
+        # Get TWS current time (this is a valid call)
+        tws_time = await ib.reqCurrentTimeAsync() # Use async version
 
-        # Define and qualify the contract
-        contract = create_contract(SYMBOL, EXCHANGE, CURRENCY)
-        logger.info(f"Qualifying contract for {SYMBOL}...")
-        qual_contracts = await ib.qualifyContractsAsync(contract)
-        if not qual_contracts:
-            logger.error(f"Could not qualify contract for {SYMBOL}. Exiting.")
-            return
-        contract = qual_contracts[0]
-        logger.info(f"Qualified contract: {contract}")
+        # MODIFIED LINE: Removed ib.serverVersion()
+        logger.info(f"Successfully connected to IB. TWS Time: {tws_time}")
 
 
         # Initial run
