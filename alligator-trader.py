@@ -113,55 +113,25 @@ async def get_historical_data(ib_conn: IB, contract: Contract, timeframe: str, d
 
 def calculate_indicators(df: pd.DataFrame, timeframe_label: str):
     """Calculates and adds technical indicators to the DataFrame."""
-    # Basic check for required columns
-    required_cols = ['open', 'high', 'low', 'close', 'volume']
-    if not all(col in df.columns for col in required_cols):
-        logger.error(f"Missing required columns {required_cols} in input DataFrame for {timeframe_label}.")
-        return pd.DataFrame()
-
-    # Check for sufficient data length BEFORE calculating median price etc.
-    # Need enough for longest lookback + longest shift (13 + 8 = 21)
-    min_rows_needed = max(ADX_PERIOD, CMO_PERIOD, STOCHRSI_PERIOD,
-                          ALLIGATOR_JAW + abs(-8), # Jaw period + shift
-                          EMA_LONGTERM_PERIOD, ATR_PERIOD) + 1 # Add 1 for safety
-    if len(df) < min_rows_needed:
-        logger.warning(f"Cannot calculate indicators on insufficient data ({len(df)} bars, need {min_rows_needed}) for {timeframe_label}")
+    if df.empty or len(df) < max(ADX_PERIOD, CMO_PERIOD, STOCHRSI_PERIOD, ALLIGATOR_JAW, EMA_LONGTERM_PERIOD, ATR_PERIOD):
+        logger.warning(f"Cannot calculate indicators on insufficient data ({len(df)} bars) for {timeframe_label}")
         return pd.DataFrame() # Return empty if not enough data
 
     logger.debug(f"Calculating indicators for {timeframe_label} timeframe")
-    df_out = df.copy() # Work on a copy
-
+    df_out = df.copy() # Work on a copy to avoid SettingWithCopyWarning
     try:
-        # --- Calculate Alligator Components Manually ---
-        # 1. Calculate Median Price
-        median_price = (df_out['high'] + df_out['low']) / 2
-
-        # 2. Calculate Smoothed Moving Averages (SMMA) using pandas_ta
-        jaw_smma = df_out.ta.smma(close=median_price, length=ALLIGATOR_JAW)
-        teeth_smma = df_out.ta.smma(close=median_price, length=ALLIGATOR_TEETH)
-        lips_smma = df_out.ta.smma(close=median_price, length=ALLIGATOR_LIPS)
-
-        # 3. Shift the SMMA values forward (use negative periods for future shift)
-        # Note: A negative shift moves data earlier in time (index decreases), effectively
-        #       plotting the value calculated N periods ago at the current time step.
-        #       This matches the "shifted into the future" definition on a chart.
-        df_out[f'alligator_jaw_{timeframe_label}'] = jaw_smma.shift(-8)
-        df_out[f'alligator_teeth_{timeframe_label}'] = teeth_smma.shift(-5)
-        df_out[f'alligator_lips_{timeframe_label}'] = lips_smma.shift(-3)
-        # --- End Alligator Calculation ---
-
+        # Alligator
+        df_out.ta.alligator(jaw_length=ALLIGATOR_JAW, teeth_length=ALLIGATOR_TEETH, lips_length=ALLIGATOR_LIPS, append=True)
+        df_out.rename(columns={
+            f'ALLIGATORj_{ALLIGATOR_JAW}_{ALLIGATOR_TEETH}_{ALLIGATOR_LIPS}': f'alligator_jaw_{timeframe_label}',
+            f'ALLIGATORt_{ALLIGATOR_JAW}_{ALLIGATOR_TEETH}_{ALLIGATOR_LIPS}': f'alligator_teeth_{timeframe_label}',
+            f'ALLIGATORl_{ALLIGATOR_JAW}_{ALLIGATOR_TEETH}_{ALLIGATOR_LIPS}': f'alligator_lips_{timeframe_label}'
+        }, inplace=True)
 
         # ADX (only needed for long-term timeframe)
         if timeframe_label == 'longterm':
-            # ADX needs high, low, close
-            adx_result = df_out.ta.adx(length=ADX_PERIOD, append=True)
-            # Check if ADX column was added (can fail on constant price data)
-            if f'ADX_{ADX_PERIOD}' in adx_result.columns:
-                 df_out.rename(columns={f'ADX_{ADX_PERIOD}': 'adx'}, inplace=True)
-            else:
-                 logger.warning(f"ADX calculation failed for {timeframe_label}. Adding NaN column.")
-                 df_out['adx'] = pd.NA
-
+            df_out.ta.adx(length=ADX_PERIOD, append=True)
+            df_out.rename(columns={f'ADX_{ADX_PERIOD}': 'adx'}, inplace=True)
 
         # CMO (only needed for primary timeframe)
         if timeframe_label == 'primary':
@@ -170,44 +140,37 @@ def calculate_indicators(df: pd.DataFrame, timeframe_label: str):
 
         # Stochastic RSI (only needed for primary timeframe)
         if timeframe_label == 'primary':
-            # StochRSI needs close prices
             stoch_rsi = df_out.ta.stochrsi(length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD, k=STOCHRSI_K, d=STOCHRSI_D, append=True)
-            k_col = f'STOCHRSIk_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}'
-            d_col = f'STOCHRSId_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}'
-            if k_col in stoch_rsi.columns: # Check if columns were added
-                df_out.rename(columns={k_col: 'stochrsi_k', d_col: 'stochrsi_d'}, inplace=True)
+            # Check if columns were actually added (can fail if input data is constant)
+            if f'STOCHRSIk_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}' in df_out.columns:
+                df_out.rename(columns={
+                    f'STOCHRSIk_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}': 'stochrsi_k',
+                    f'STOCHRSId_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}': 'stochrsi_d'
+                }, inplace=True)
             else:
-                logger.warning(f"StochRSI calculation failed for {timeframe_label}. Adding NaN columns.")
+                logger.warning(f"StochRSI calculation did not add columns for {timeframe_label}. Adding NaNs.")
                 df_out['stochrsi_k'] = pd.NA
                 df_out['stochrsi_d'] = pd.NA
 
 
         # EMA (only needed for long-term timeframe)
         if timeframe_label == 'longterm':
-             # EMA needs close prices
              df_out.ta.ema(length=EMA_LONGTERM_PERIOD, append=True)
              df_out.rename(columns={f'EMA_{EMA_LONGTERM_PERIOD}': f'ema_{EMA_LONGTERM_PERIOD}'}, inplace=True)
 
         # ATR (only needed for primary timeframe, for SL/TP)
         if timeframe_label == 'primary':
-             # ATR needs high, low, close
              df_out.ta.atr(length=ATR_PERIOD, append=True)
              df_out.rename(columns={f'ATRr_{ATR_PERIOD}': 'atr'}, inplace=True)
 
         # Drop initial rows with NaNs from indicator calculations BEFORE returning
-        # The shift operation introduces NaNs, dropna handles these and indicator NaNs
-        original_rows = len(df_out)
+        # Keep original index for alignment if needed later
         df_out.dropna(inplace=True)
-        logger.debug(f"Finished calculating indicators for {timeframe_label}, {len(df_out)} rows remain after dropna (started with {original_rows}).")
+        logger.debug(f"Finished calculating indicators for {timeframe_label}, {len(df_out)} rows remain after dropna.")
 
     except Exception as e:
         logger.error(f"Error calculating indicators for {timeframe_label}: {e}", exc_info=True)
         return pd.DataFrame() # Return empty on error
-
-    # Final check if df is empty after dropna
-    if df_out.empty:
-        logger.warning(f"DataFrame became empty after indicator calculation and dropna for {timeframe_label}.")
-
     return df_out
 
 
