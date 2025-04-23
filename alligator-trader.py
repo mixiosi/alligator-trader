@@ -506,35 +506,52 @@ async def run_strategy():
 
     # --- 6. Get Latest Data Point ---
     try:
-        # Use .iloc[-1] to get the last row
+        # Get the absolute latest primary bar after indicator calculation
         latest_primary = df_primary_ind.iloc[-1]
-        # Find corresponding longterm bar (can be slightly tricky with different timeframes)
-        # Simplest: use the latest longterm bar available
-        latest_longterm = df_longterm_ind.iloc[-1]
+        primary_timestamp = latest_primary.name # Timestamp of the latest primary bar
+
+        logger.debug(f"Latest primary bar timestamp: {primary_timestamp}")
+
+        # Find the latest longterm bar whose timestamp is AT OR BEFORE the latest primary bar's timestamp
+        # This ensures we use longterm data that was available when the primary signal occurred.
+        relevant_longterm_df = df_longterm_ind.loc[:primary_timestamp] # Select rows up to primary_timestamp
+
+        if relevant_longterm_df.empty:
+            logger.warning(f"No long-term data available at or before the latest primary timestamp ({primary_timestamp}). Cannot align data. Skipping check.")
+            return
+
+        # Get the last row from this relevant selection
+        latest_longterm = relevant_longterm_df.iloc[-1]
+        longterm_timestamp = latest_longterm.name
+        logger.debug(f"Aligned longterm bar timestamp: {longterm_timestamp}")
+
+
         current_price = latest_primary['close'] # Use primary close price for checks & orders
 
-        # Check alignment (optional but good practice)
-        # Get the max timeframe duration in hours for the check
+        # Check alignment AGAIN after explicit alignment logic
+        time_diff = abs(primary_timestamp - longterm_timestamp)
         max_tf_hours = max(timeframe_to_hours(PRIMARY_TIMEFRAME.split()), timeframe_to_hours(LONGTERM_TIMEFRAME.split()))
         allowed_lag = pd.Timedelta(hours=max_tf_hours * 1.5) # Allow 1.5x the longest bar duration lag
-        time_diff = abs(latest_primary.name - latest_longterm.name)
 
         if time_diff > allowed_lag:
-             logger.warning(f"Significant time difference between latest primary ({latest_primary.name}) and longterm ({latest_longterm.name}) bars: {time_diff} (Allowed: {allowed_lag}). Check data fetching/alignment.")
-             # Decide whether to proceed or skip if alignment is critical
+             # This warning should be less frequent now, but might still occur if data fetching has large gaps
+             logger.warning(f"Significant time difference REMAINS after alignment logic between primary ({primary_timestamp}) and longterm ({longterm_timestamp}) bars: {time_diff} (Allowed: {allowed_lag}). Check data quality/gaps.")
+             # Decide whether to proceed or skip if alignment is critical even after this logic
              # return # Uncomment to skip if alignment fails
 
     except IndexError:
         logger.warning("Not enough data rows after indicator calculation to get latest data. Skipping check.")
         return
+    except KeyError as e:
+        logger.error(f"KeyError accessing aligned data, likely empty selection: {e}. Primary timestamp: {primary_timestamp}, Longterm DF index: {df_longterm_ind.index.min()} to {df_longterm_ind.index.max()}", exc_info=True)
+        return
     except Exception as e:
-        logger.error(f"Error accessing latest data points: {e}", exc_info=True)
+        logger.error(f"Error during data alignment or accessing latest data points: {e}", exc_info=True)
         return
 
-
-    # Check for NaN values in latest row again (should have been dropped, but good sanity check)
+    # --- Check for NaN values in the *aligned* latest rows ---
     if latest_primary.isnull().any() or latest_longterm.isnull().any():
-         logger.warning(f"Latest data row contains NaN values after processing. Skipping check. Primary NaNs: {latest_primary.isnull().sum()}, Longterm NaNs: {latest_longterm.isnull().sum()}")
+         logger.warning(f"Aligned latest data row contains NaN values. Skipping check. Primary ({primary_timestamp}) NaNs: {latest_primary.isnull().sum()}, Longterm ({longterm_timestamp}) NaNs: {latest_longterm.isnull().sum()}")
          return
 
     # --- 7. Evaluate Strategy Conditions ---
