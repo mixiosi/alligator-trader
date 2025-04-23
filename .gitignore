@@ -1,0 +1,22 @@
+# Environment variables
+.env
+
+# Virtual environment
+.venv/
+venv/
+ENV/
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# IDE specific files (examples, add yours if needed)
+.idea/
+.vscode/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
