@@ -432,12 +432,14 @@ async def main():
         logger.info("Successfully connected to IB.")
 
         # Wait for connection readiness by making an initial request
-        # REMOVED 'subscribe=False' from the next line
-        acct_vals = await ib.reqAccountValuesAsync() # Using reqAccountValuesAsync is often better just to get a snapshot
-        if not acct_vals:
-            logger.warning("Initial account value request returned empty, but connection seems established.")
-        # Alternatively, keep reqAccountUpdatesAsync without subscribe=False if you prefer:
-        # await ib.reqAccountUpdatesAsync(account='All')
+        # REVERTING to reqAccountUpdatesAsync, without 'subscribe=False'
+        logger.info("Requesting initial account updates to confirm connection readiness...")
+        updates = await ib.reqAccountUpdatesAsync(account='All')
+        if not updates:
+             logger.warning("Initial account update request returned no specific updates, but connection seems okay.")
+        # Ensure we 'consume' the async generator result if needed, or just await it.
+        # Depending on ib_insync version, simply awaiting might be enough.
+        # If you encounter issues later, you might need: async for update in updates: pass
 
         logger.info("Connection appears established.")
 
