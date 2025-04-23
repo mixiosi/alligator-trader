@@ -432,20 +432,23 @@ async def main():
         logger.info("Successfully connected to IB.")
 
         # Wait for connection readiness by making an initial request
-        # REVERTING to reqAccountUpdatesAsync, without 'subscribe=False'
-        logger.info("Requesting initial account updates to confirm connection readiness...")
-        updates = await ib.reqAccountUpdatesAsync(account='All')
-        if not updates:
-             logger.warning("Initial account update request returned no specific updates, but connection seems okay.")
-        # Ensure we 'consume' the async generator result if needed, or just await it.
-        # Depending on ib_insync version, simply awaiting might be enough.
-        # If you encounter issues later, you might need: async for update in updates: pass
-
-        logger.info("Connection appears established.")
+        # SWITCHING to reqAccountSummaryAsync for a non-blocking check
+        logger.info("Requesting account summary snapshot to confirm connection readiness...")
+        try:
+            # Request a common tag like NetLiquidation
+            summary = await ib.reqAccountSummaryAsync(account='All', tags='NetLiquidation')
+            if summary:
+                logger.info(f"Account summary received (e.g., {summary[0].tag}={summary[0].value}). Connection ready.")
+            else:
+                logger.warning("Account summary request returned empty, but proceeding. Connection might be okay.")
+        except Exception as e:
+            logger.error(f"Error during account summary request: {e}. Aborting.", exc_info=True)
+            return # Exit if the readiness check itself fails
 
         # Define the contract
         contract = create_contract(SYMBOL, EXCHANGE, CURRENCY)
         # Qualify the contract (resolves specifics like conId, primaryExchange)
+        logger.info(f"Qualifying contract for {SYMBOL}...")
         qual_contracts = await ib.qualifyContractsAsync(contract)
         if not qual_contracts:
             logger.error(f"Could not qualify contract for {SYMBOL}. Exiting.")
