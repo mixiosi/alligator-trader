@@ -1,166 +1,174 @@
-"""
-alligator_trader.py
-
-A bracket-order trading bot using Williams' Alligator indicator,
-CMO, Stochastic RSI, ADX, EMA, and ATR from pandas-ta,
-executed on Interactive Brokers via IB-insync.
-"""
-
-import argparse
+# -*- coding: utf-8 -*-
 import asyncio
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
+import time # Keep time for potential sleeps if needed
+
 import pandas as pd
 import pandas_ta as ta
-from ib_insync import IB, Stock, Contract, MarketOrder, LimitOrder, StopOrder, Trade, util
-
-# --- Helper: Convert timeframe string to seconds ---
-def timeframe_to_seconds(tf: str) -> int:
-    """Convert a timeframe (e.g. '30 mins', '4 hours') to seconds."""
-    parts = tf.split()
-    value, unit = int(parts[0]), parts[1].lower()
-    if 'min' in unit:
-        return value * 60
-    if 'hour' in unit:
-        return value * 3600
-    if 'day' in unit:
-        return value * 86400
-    raise ValueError(f"Unrecognized timeframe unit: {unit}")  # :contentReference[oaicite:2]{index=2}
-
-# --- CLI Arguments ---
-parser = argparse.ArgumentParser(description="Alligator Trader Bot")
-parser.add_argument(
-    "--primary-tf", dest="primary_tf",
-    default="4 hours",
-    help="Primary timeframe, e.g. '30 mins', '4 hours'")        # :contentReference[oaicite:3]{index=3}
-parser.add_argument(
-    "--longterm-tf", dest="longterm_tf",
-    default="8 hours",
-    help="Long-term timeframe, e.g. '4 hours', '1 day'")
-args = parser.parse_args()
+from ib_insync import IB, Stock, Contract, MarketOrder, LimitOrder, StopOrder, Order, Trade, util # Added Order, Trade
 
 # --- Configuration ---
+# TWS/Gateway Connection
 IB_HOST = '127.0.0.1'
-IB_PORT = 7497
-IB_CLIENT_ID = 2
-SYMBOL, EXCHANGE, CURRENCY = 'MSTR', 'SMART', 'USD'
-PRIMARY_TIMEFRAME  = args.primary_tf
-LONGTERM_TIMEFRAME = args.longterm_tf
-RUN_INTERVAL_SECONDS = timeframe_to_seconds(PRIMARY_TIMEFRAME)
-ORDER_SIZE_PERCENT = 0.01
-SL_ATR_MULTIPLIER, TP_ATR_MULTIPLIER = 1.5, 3.0
-MAX_DATA_REQUEST_BARS = 300
-LOG_LEVEL = logging.INFO
+IB_PORT = 7497  # 7497 for TWS Paper, 7496 for TWS Live, 4002 for Gateway Paper, 4001 for Gateway Live
+IB_CLIENT_ID = 2 # Use a different client ID than bb_ml_stable3 if running concurrently
 
-# Indicator params
+# Trading Parameters
+SYMBOL = 'MSTR'
+EXCHANGE = 'SMART'
+CURRENCY = 'USD'
+PRIMARY_TIMEFRAME = '4 hours' # Timeframe for primary signals (CMO, StochRSI, current Alligator, ATR)
+# CHANGED '6 hours' to '8 hours' (valid IB API bar size)
+LONGTERM_TIMEFRAME = '8 hours' # Timeframe for long-term confirmation (ADX, LT Alligator, LT EMA)
+ORDER_SIZE_PERCENT = 0.01 # Risk 1% of portfolio value per trade (adjust as needed)
+SL_ATR_MULTIPLIER = 1.5   # Stop loss distance in ATR multiples
+TP_ATR_MULTIPLIER = 3.0   # Take profit distance in ATR multiples
+
+# Indicator Settings
 ADX_PERIOD = 14
 CMO_PERIOD = 14
-STOCHRSI_PERIOD, STOCHRSI_K, STOCHRSI_D = 14, 3, 3
-ALLIGATOR_JAW, ALLIGATOR_TEETH, ALLIGATOR_LIPS = 13, 8, 5
+STOCHRSI_PERIOD = 14
+STOCHRSI_K = 3
+STOCHRSI_D = 3
+ALLIGATOR_JAW = 13
+ALLIGATOR_TEETH = 8
+ALLIGATOR_LIPS = 5
 EMA_LONGTERM_PERIOD = 100
-ATR_PERIOD = 14
+ATR_PERIOD = 14 # Used for SL/TP calculation on PRIMARY_TIMEFRAME
 
-# Strategy thresholds
-ADX_THRESHOLD = 25
-CMO_LONG_THRESHOLD = 5
-CMO_SHORT_THRESHOLD = -5
-STOCHRSI_OVERSOLD  = 20
-STOCHRSI_OVERBOUGHT = 80
+# Strategy Thresholds
+ADX_THRESHOLD = 25       # Minimum ADX to confirm trend strength
+CMO_LONG_THRESHOLD = 5   # CMO must be above this for long entry
+CMO_SHORT_THRESHOLD = -5  # CMO must be below this for short entry
+STOCHRSI_OVERSOLD = 20   # StochRSI below this indicates oversold (for long)
+STOCHRSI_OVERBOUGHT = 80 # StochRSI above this indicates overbought (for short)
+
+# Other Settings
+RUN_INTERVAL_SECONDS = 4 * 60 * 60 # Check every 4 hours (adjust as needed)
+# RUN_INTERVAL_SECONDS = 60 * 5 # For testing: Check every 5 minutes
+MAX_DATA_REQUEST_BARS = 300 # How many bars to fetch (ensure enough for longest lookback)
+LOG_LEVEL = logging.INFO # DEBUG, INFO, WARNING, ERROR
+ACCOUNT_SYNC_WAIT_SECONDS = 5 # How long to wait after connection for account data
 
 # --- Logging Setup ---
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
-logger = logging.getLogger(__name__)
+# Use ib_insync's logging integration
+# util.logToConsole(LOG_LEVEL) # Uncomment for detailed ib_insync logs
+logging.basicConfig(level=LOG_LEVEL, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__) # Use __name__ for clarity
 
-# --- Globals ---
-ib: IB = None
-contract = None       # Will hold the qualified Stock contract
-active_trade_pending = False
-active_parent_order_id = None
+# --- Global Variables ---
+ib: IB = None # IB connection object, type hint added
+contract: Contract = None # Stock contract object
+active_trade_pending: bool = False # Flag to prevent overlapping orders
+active_parent_order_id: int = None # Store the ID of the pending parent order
 
-# --- Helpers ---
+# --- Helper Functions ---
+
 def create_contract(symbol, exchange, currency):
-    """Return a Stock contract for IB."""
+    """Creates an IB stock contract object."""
     return Stock(symbol, exchange, currency)
 
+# Function from working example, adapted slightly
 def round_price(price, tick_size=0.01):
-    """Round a price to nearest tick size."""
-    return round(round(price / tick_size) * tick_size, 2)
+    """Rounds price to the nearest tick size."""
+    return round(round(price / tick_size) * tick_size, 2) # Ensure 2 decimal places common for USD stocks
 
-# --- Fetch Historical Data ---
-async def get_historical_data(ib_conn, contract, tf, duration) -> pd.DataFrame:
-    """Asynchronously request OHLCV bars from IB."""
-    bars = await ib_conn.reqHistoricalDataAsync(
-        contract, endDateTime='',
-        durationStr=duration,
-        barSizeSetting=tf,
-        whatToShow='TRADES',
-        useRTH=False,
-        formatDate=1
-    )
-    df = util.df(bars)
-    if df is None or df.empty:
+
+async def get_historical_data(ib_conn: IB, contract: Contract, timeframe: str, duration: str):
+    """Fetches historical OHLCV data."""
+    try:
+        logger.debug(f"Requesting historical data for {contract.symbol} - Timeframe: {timeframe}, Duration: {duration}")
+        bars = await ib_conn.reqHistoricalDataAsync(
+            contract,
+            endDateTime='',
+            durationStr=duration,
+            barSizeSetting=timeframe,
+            whatToShow='TRADES',
+            useRTH=False, # Use data outside regular trading hours if available
+            formatDate=1 # Return as datetime objects
+        )
+        if not bars:
+            logger.warning(f"No historical data returned for {contract.symbol} - {timeframe}")
+            return pd.DataFrame()
+
+        df = util.df(bars)
+        if df is None or df.empty:
+             logger.warning(f"Empty DataFrame after conversion for {contract.symbol} - {timeframe}")
+             return pd.DataFrame()
+
+        df['date'] = pd.to_datetime(df['date'])
+        df.set_index('date', inplace=True)
+        logger.info(f"Successfully retrieved {len(df)} bars for {contract.symbol} - {timeframe}")
+        # Keep original column names from IB for clarity
+        return df
+
+    except ConnectionError as ce:
+        logger.error(f"ConnectionError fetching historical data for {contract.symbol} - {timeframe}: {ce}. Check TWS/Gateway connection.")
+        # Potentially trigger a reconnection attempt or shutdown
         return pd.DataFrame()
-    df['date'] = pd.to_datetime(df['date'])
-    df.set_index('date', inplace=True)
-    return df
+    except Exception as e:
+        logger.error(f"Error fetching historical data for {contract.symbol} - {timeframe}: {e}", exc_info=True)
+        return pd.DataFrame()
 
-# --- Indicator Calculation ---
-def calculate_indicators(df: pd.DataFrame, label: str) -> pd.DataFrame:
-    """Append indicators to DataFrame using pandas-ta."""
-    min_bars = max(
-        ADX_PERIOD, CMO_PERIOD, STOCHRSI_PERIOD,
-        ALLIGATOR_JAW, EMA_LONGTERM_PERIOD, ATR_PERIOD
-    )
+def calculate_indicators(df: pd.DataFrame, timeframe_label: str):
+    """Calculates and adds technical indicators to the DataFrame."""
+    min_bars = max(ADX_PERIOD, CMO_PERIOD, STOCHRSI_PERIOD,
+                   ALLIGATOR_JAW, EMA_LONGTERM_PERIOD, ATR_PERIOD)
     if df.empty or len(df) < min_bars:
+        logger.warning(f"Cannot calculate indicators on insufficient data ({len(df)} bars) for {timeframe_label}")
         return pd.DataFrame()
 
-    out = df.copy()
-    # Alligator with named columns :contentReference[oaicite:4]{index=4}
-    out.ta.alligator(
-        jaw_length=ALLIGATOR_JAW,
-        teeth_length=ALLIGATOR_TEETH,
-        lips_length=ALLIGATOR_LIPS,
-        append=True,
-        col_names=(
-            f'alligator_jaw_{label}',
-            f'alligator_teeth_{label}',
-            f'alligator_lips_{label}'
-        )
-    )
-
-    if label == 'primary':
-        # CMO :contentReference[oaicite:5]{index=5}
-        out.ta.cmo(length=CMO_PERIOD, append=True)
-        out.rename(columns={f'CMO_{CMO_PERIOD}':'cmo'}, inplace=True)
-        # StochRSI :contentReference[oaicite:6]{index=6}
-        out.ta.stochrsi(
-            length=STOCHRSI_PERIOD, rsi_length=STOCHRSI_PERIOD,
-            k=STOCHRSI_K, d=STOCHRSI_D, append=True
-        )
-        out.rename(columns={
-            f'STOCHRSIk_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}':'stochrsi_k',
-            f'STOCHRSId_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}':'stochrsi_d'
-        }, inplace=True)
-        # ATR :contentReference[oaicite:7]{index=7}
-        out.ta.atr(length=ATR_PERIOD, append=True)
-        out.rename(columns={f'ATRr_{ATR_PERIOD}':'atr'}, inplace=True)
-
-    else:
-        # ADX :contentReference[oaicite:8]{index=8}
-        out.ta.adx(length=ADX_PERIOD, append=True)
-        out.rename(columns={f'ADX_{ADX_PERIOD}':'adx'}, inplace=True)
-        # EMA
-        out.ta.ema(length=EMA_LONGTERM_PERIOD, append=True)
-        out.rename(
-            columns={f'EMA_{EMA_LONGTERM_PERIOD}':f'ema_{EMA_LONGTERM_PERIOD}'},
-            inplace=True
+    df_out = df.copy()
+    try:
+        # --- Alligator (with direct col_names override) ---
+        df_out.ta.alligator(
+            jaw_length=ALLIGATOR_JAW,
+            teeth_length=ALLIGATOR_TEETH,
+            lips_length=ALLIGATOR_LIPS,
+            append=True,
+            col_names=(
+                f"alligator_jaw_{timeframe_label}",
+                f"alligator_teeth_{timeframe_label}",
+                f"alligator_lips_{timeframe_label}"
+            )
         )
 
-    out.dropna(inplace=True)
-    return out
+        # --- Long-term only indicators ---
+        if timeframe_label == 'longterm':
+            df_out.ta.adx(length=ADX_PERIOD, append=True)
+            df_out.rename(columns={f'ADX_{ADX_PERIOD}': 'adx'}, inplace=True)
+
+            df_out.ta.ema(length=EMA_LONGTERM_PERIOD, append=True)
+            df_out.rename(columns={f'EMA_{EMA_LONGTERM_PERIOD}': f'ema_{EMA_LONGTERM_PERIOD}'},
+                          inplace=True)
+
+        # --- Primary timeframe only indicators ---
+        if timeframe_label == 'primary':
+            df_out.ta.cmo(length=CMO_PERIOD, append=True)
+            df_out.rename(columns={f'CMO_{CMO_PERIOD}': 'cmo'}, inplace=True)
+
+            df_out.ta.stochrsi(length=STOCHRSI_PERIOD,
+                               rsi_length=STOCHRSI_PERIOD,
+                               k=STOCHRSI_K, d=STOCHRSI_D,
+                               append=True)
+            df_out.rename(columns={
+                f'STOCHRSIk_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}': 'stochrsi_k',
+                f'STOCHRSId_{STOCHRSI_PERIOD}_{STOCHRSI_PERIOD}_{STOCHRSI_K}_{STOCHRSI_D}': 'stochrsi_d'
+            }, inplace=True)
+
+            df_out.ta.atr(length=ATR_PERIOD, append=True)
+            df_out.rename(columns={f'ATRr_{ATR_PERIOD}': 'atr'}, inplace=True)
+
+        # Drop any NaNs from initial indicator warm-up
+        df_out.dropna(inplace=True)
+
+    except Exception as e:
+        logger.error(f"Error calculating indicators for {timeframe_label}: {e}", exc_info=True)
+        return pd.DataFrame()
+
+    return df_out
+
 
 def determine_alligator_trend(jaw, teeth, lips):
     """Determines trend based on the latest Alligator values."""
@@ -654,32 +662,74 @@ async def run_strategy():
 
 
 # --- Main Execution ---
-
 async def main():
     global ib, contract
-    ib = IB()  # :contentReference[oaicite:9]{index=9}
+    ib = IB()
+
+    # Register event handlers BEFORE connecting
     ib.orderStatusEvent += onOrderStatus
+    # ib.errorEvent += onError # Example: Define an onError handler if needed
+    # ib.disconnectedEvent += onDisconnected # Example: Handle disconnections
 
-    await ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID)
-    tws_time = await ib.reqCurrentTimeAsync()
-    logger.info(f"Connected to IB. TWS Time: {tws_time}")
+    try:
+        logger.info(f"Connecting to IB TWS/Gateway at {IB_HOST}:{IB_PORT} with ClientID {IB_CLIENT_ID}...")
+        await ib.connectAsync(IB_HOST, IB_PORT, clientId=IB_CLIENT_ID, timeout=20) # Increased timeout
 
-    # Qualify contract
-    contract = (await ib.qualifyContractsAsync(
-        create_contract(SYMBOL, EXCHANGE, CURRENCY)))[0]
+        # Get TWS current time (this is a valid call)
+        tws_time = await ib.reqCurrentTimeAsync() # Use async version
 
-    # Initial run
-    await run_strategy()
+        # MODIFIED LINE: Removed ib.serverVersion()
+        logger.info(f"Successfully connected to IB. TWS Time: {tws_time}")
 
-    # Loop forever at the chosen interval
-    while True:
-        await asyncio.sleep(RUN_INTERVAL_SECONDS)
-        if not ib.isConnected():
-            logger.warning("IB disconnected, exiting.")
-            break
+
+        # Initial run
         await run_strategy()
 
-if __name__ == '__main__':
-    import nest_asyncio
-    nest_asyncio.apply()
-    util.run(main())
+        # Schedule periodic runs
+        while True:
+            await asyncio.sleep(RUN_INTERVAL_SECONDS)
+            # Check connection before running strategy
+            if not ib.isConnected():
+                 logger.warning("IB Disconnected. Stopping strategy loop.")
+                 break # Exit the loop if disconnected
+
+            # Optional: Refresh positions cache periodically if needed
+            # logger.debug("Requesting positions update...")
+            # await ib.reqPositionsAsync()
+            # await asyncio.sleep(1) # Small delay after request
+
+            await run_strategy()
+
+
+    except ConnectionRefusedError:
+        logger.error(f"Connection refused. Is TWS/Gateway running and API enabled on port {IB_PORT}?")
+    except asyncio.TimeoutError:
+         logger.error(f"Connection timed out. Check network and TWS/Gateway settings.")
+    except Exception as e:
+        logger.exception(f"An unexpected error occurred in main loop: {e}")
+    finally:
+        if ib and ib.isConnected():
+            logger.info("Disconnecting from IB.")
+            # Cancel pending order status tracking? No explicit cancellation needed.
+            ib.disconnect()
+        logger.info("Program finished.")
+
+
+if __name__ == "__main__":
+    # Use nest_asyncio if running in Jupyter/Spyder/etc.
+    try:
+        import nest_asyncio
+        nest_asyncio.apply()
+        logger.info("Applied nest_asyncio patch.")
+    except ImportError:
+        logger.info("nest_asyncio not found. Skipping patch.")
+
+    # Run the main async loop using ib_insync's utility
+    try:
+        util.run(main())
+    except KeyboardInterrupt:
+        logger.info("Program terminated by user (KeyboardInterrupt).")
+    except SystemExit:
+        logger.info("Program exited.") # Catch potential sys.exit() calls
+    except Exception as e:
+         logger.critical(f"Fatal error during main execution: {e}", exc_info=True)
